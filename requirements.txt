@@ -1,0 +1,9 @@
+opencv-python
+mediapipe==0.10.9
+pyautogui
+numpy
+SpeechRecognition
+pyttsx3
+pyaudio
+gTTS
+pygame
