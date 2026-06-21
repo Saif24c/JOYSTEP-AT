@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -863,23 +863,16 @@
         treat.className = 'absolute text-[5rem] pointer-events-none drop-shadow-2xl z-20';
       }
       
-      // --- NEW FIX #2 CODE STARTS HERE ---
-      const xPercent = (Math.random() * 60 + 20); // Calculate this once
-      treat.style.left = xPercent + '%';
+      treat.style.left = (Math.random() * 60 + 20) + '%';
       treat.style.bottom = '-20%'; 
       treatsContainer.appendChild(treat);
       setTimeout(() => treat.style.opacity = "1", 50);
 
       activeFruits.push({
-          element: treat, 
-          bottom: -20, 
-          xPercent: xPercent, // Save it in memory so we don't have to ask the DOM
-          swayOffset: Math.random() * 10,
-          isMagicHelp: isMagicHelp, 
-          speed: isMagicHelp ? 0.020 : 0.025 
+          element: treat, bottom: -20, swayOffset: Math.random() * 10,
+          isMagicHelp: isMagicHelp, speed: isMagicHelp ? 0.020 : 0.025 
       });
       treat.dataset.isMagicHelp = isMagicHelp; 
-      // --- NEW FIX #2 CODE ENDS HERE ---
     }
 
     function onHandResults(results) {
@@ -947,25 +940,26 @@
 
           let validActiveGrab = isFist && window.handReadyState[handIndex];
 
-          // --- NEW FIX #3 CODE STARTS HERE ---
-          activeFruits.forEach(f => {
-            const treat = f.element;
+          Array.from(treatsContainer.children).forEach(treat => {
             if(treat.dataset.popped === "true") return;
 
-            // Calculate pixel positions purely from memory variables (Zero lag)
-            const tx = canvasRect.left + (f.xPercent / 100 * canvasRect.width);
-            let ty = canvasRect.top + canvasRect.height - ((f.bottom / 100) * canvasRect.height);
+            const tRect = treat.getBoundingClientRect();
+            const tx = tRect.left + (tRect.width / 2);
+            let ty = tRect.top + (tRect.height / 2);
             
+           
             // FORGIVING PANDA CATCHING
-            if (f.isMagicHelp) {
-               ty -= 60; // Target slightly higher for the center of the panda
+            if (treat.dataset.isMagicHelp === 'true') {
+               ty = tRect.top + (tRect.height / 2); // Target the middle of the panda
+               hitRadius = 180; // Big, forgiving radius so kids can easily catch it!
             }
             
             // Flipped X coordinates for accurate CSS matching
             const dist = Math.hypot(canvasRect.left + ((1-truePalmX)*canvasRect.width) - tx, fyPalm - ty);
 
             let canCatch = false;
-            if (f.isMagicHelp) {
+            if (treat.dataset.isMagicHelp === 'true') {
+               // Fixed: Joy star REQUIRES a valid pinch to catch now!
                canCatch = (dist < 100) && validActiveGrab;
             } else {
                canCatch = (dist < 80) && validActiveGrab;
@@ -977,7 +971,7 @@
               treat.dataset.popped = "true"; 
               playPop(); 
               
-              if(!f.isMagicHelp) treat.innerText = '✨'; 
+              if(treat.dataset.isMagicHelp !== 'true') treat.innerText = '✨'; 
               else { isHelpingMode = false; gameLoopInterval = setInterval(spawnTreat, 2500); }
               
               score++; missedTreats = 0; 
@@ -1168,7 +1162,7 @@
     // MAIN CAMERA MULTIPLEXER
     // ==============================================
     const handsAi = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
-    handsAi.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+    handsAi.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
     handsAi.onResults(onHandResults);
 
     const faceMeshAi = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
