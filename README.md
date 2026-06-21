@@ -1,5 +1,9 @@
 # JOYSTEP AT
 
+## Live Demo
+
+https://saif24c.github.io/JOYSTEP-AT/
+
 ## Overview
 
 JOYSTEP AT is an AI-powered Assistive Technology platform designed to help individuals with motor disabilities interact with computers using hand gestures, facial movements, and voice commands.
