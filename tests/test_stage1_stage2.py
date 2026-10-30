@@ -774,6 +774,16 @@ def test_voice_recognition_retries_short_error_without_retaining_audio():
     assert recognizer.phrases == []
 
 
+def test_tts_cleanup_unloads_pygame_audio_before_deleting_temp_file():
+    calls = []
+    music = type("Music", (), {
+        "stop": lambda self: calls.append("stop"),
+        "unload": lambda self: calls.append("unload"),
+    })()
+    assert app.release_tts_temp_file(music, "voice.mp3", remove=lambda path: calls.append(("delete", path)))
+    assert calls == ["stop", "unload", ("delete", "voice.mp3")]
+
+
 @pytest.mark.parametrize("text", [
     "AI Assist move the cursor to the centre",
     "AI Assist: move the cursor to the centre",

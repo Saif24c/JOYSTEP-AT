@@ -352,6 +352,28 @@ class ClickRipple:
 #    2. If pyttsx3 silent/broken → fall back to gTTS (online) + pygame mixer
 #       Install fallback:  pip install gTTS pygame
 # ═══════════════════════════════════════════════════════════════════════
+def release_tts_temp_file(music, path: str, *, remove=os.unlink, sleep=time.sleep) -> bool:
+    """Release pygame's Windows file handle before removing a temporary MP3."""
+    try:
+        music.stop()
+        unload = getattr(music, "unload", None)
+        if callable(unload):
+            unload()
+    except Exception:
+        # Cleanup must never turn a successful spoken response into an error.
+        pass
+    for attempt in range(3):
+        try:
+            remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt < 2:
+                sleep(0.05)
+    return False
+
+
 class JarvisVoice:
     def __init__(self):
         self._q      = queue.Queue()
@@ -401,6 +423,7 @@ class JarvisVoice:
                 if text is None:
                     break
                 print(f"[JARVIS] {text}")
+                fpath = None
                 try:
                     with tempfile.NamedTemporaryFile(suffix=".mp3",
                                                     delete=False) as f:
@@ -410,9 +433,11 @@ class JarvisVoice:
                     pygame.mixer.music.play()
                     while pygame.mixer.music.get_busy():
                         time.sleep(0.05)
-                    _os.unlink(fpath)
                 except Exception as e2:
                     print(f"[TTS] gTTS error: {e2}")
+                finally:
+                    if fpath and not release_tts_temp_file(pygame.mixer.music, fpath):
+                        print("[TTS] Temporary speech audio will be removed by Windows later.")
             return
         except Exception as ex2:
             print(f"[TTS] gTTS fallback also failed ({ex2}).")
