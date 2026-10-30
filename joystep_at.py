@@ -92,7 +92,20 @@ from datetime import datetime
 
 from joystep_core.metrics import BaselineMetrics, ProcessSampler
 from joystep_core.state import AppEvent, ApplicationState, EventType
-from joystep_core.cursor import PassThroughCursorPipeline
+from joystep_core.cursor import (
+    AccessibilityCursorPipeline, ClickArbiter, ClickEvent,
+    DwellClickController, PassThroughCursorPipeline,
+)
+from joystep_core.applications import ApplicationRouter, WindowsApplicationContextProvider
+from joystep_core.commands import CommandExecutor, recognize_and_execute
+from joystep_core.intents import IntentKind, parse_voice_intent
+from joystep_core.word import WordAdapter
+from joystep_core.ai.executor import RestrictedInputExecutor
+from joystep_core.ai.provider import (
+    EphemeralScreenPerception, OpenAIProvider, GeminiProvider, StaticPerception,
+    UnavailableAIProvider, select_ai_provider,
+)
+from joystep_core.ai.session import AIAssistSession, AISessionState
 
 import cv2
 import mediapipe as mp
@@ -138,6 +151,9 @@ WAKE_WORD         = "jarvis"
 LISTEN_TIMEOUT    = 6      # seconds to wait for command after wake
 SPEECH_RATE       = 160    # TTS words per minute
 DICTATION_PAUSE   = 1.5    # pause in speech before committing dictated text
+AWAKE_SESSION_TIMEOUT = max(5, int(os.environ.get("JOYSTEP_AWAKE_TIMEOUT_SECONDS", "45")))
+VOICE_COMMAND_RETRIES = max(0, int(os.environ.get("JOYSTEP_VOICE_COMMAND_RETRIES", "1")))
+VOICE_COMMAND_PHRASE_LIMIT = max(2, int(os.environ.get("JOYSTEP_VOICE_PHRASE_LIMIT_SECONDS", "8")))
 
 # ── Click animation ──────────────────────────────────────────────────
 CLICK_RIPPLE_MS   = 350    # duration of click ripple animation in ms
@@ -951,12 +967,14 @@ def smooth_click(x: int = None, y: int = None):
         smooth_move(x, y, 0.10)
     pyautogui.click()
 
-def process_voice_command(
+def _execute_legacy_voice_command(
     cmd: str,
     banner: Banner,
     jarvis: JarvisVoice,
     state: dict,          # mutable app state dict
     ripple: ClickRipple,
+    accessibility: AccessibilityCursorPipeline | None = None,
+    click_arbiter: ClickArbiter | None = None,
 ) -> None:
     """
     Parse and execute any voice command.
@@ -965,6 +983,61 @@ def process_voice_command(
     cmd = cmd.strip().lower()
     ts  = time.strftime('%H:%M:%S')
     print(f"[{ts}] CMD: '{cmd}'")
+
+    # ── Optional accessibility cursor controls (all default OFF) ──────
+    if accessibility and cmd in ("cursor stabilization on", "turn on cursor stabilization"):
+        accessibility.set_stabilization(True)
+        banner.show("CURSOR STABILIZATION ON", C_JARVIS)
+        jarvis.say("Cursor stabilization on.")
+        return
+    if accessibility and cmd in ("cursor stabilization off", "turn off cursor stabilization"):
+        accessibility.set_stabilization(False)
+        banner.show("CURSOR STABILIZATION OFF", C_JARVIS)
+        jarvis.say("Cursor stabilization off.")
+        return
+    if accessibility and cmd in ("precision mode on", "turn on precision mode"):
+        if accessibility.set_precision(True, pyautogui.position()):
+            banner.show("PRECISION MODE ON", C_JARVIS)
+            jarvis.say("Precision mode on.")
+        else:
+            banner.show("PRECISION UNAVAILABLE", C_PAUSE, sub="Move the cursor first")
+            jarvis.say("Move the cursor first, then enable precision mode.")
+        return
+    if accessibility and cmd in ("precision mode off", "turn off precision mode"):
+        accessibility.set_precision(False, pyautogui.position())
+        banner.show("PRECISION MODE OFF", C_JARVIS)
+        jarvis.say("Precision mode off.")
+        return
+    if accessibility and cmd in ("lock cursor", "cursor lock"):
+        accessibility.set_locked(True)
+        if click_arbiter: click_arbiter.set_physical_locked(True)
+        banner.show("CURSOR LOCKED", C_PAUSE, sub="Voice remains available")
+        jarvis.say("Cursor locked. Voice remains available.")
+        return
+    if accessibility and cmd in ("unlock cursor", "cursor unlock"):
+        accessibility.set_locked(False)
+        if click_arbiter: click_arbiter.set_physical_locked(False)
+        banner.show("CURSOR UNLOCKED", C_TRACK, sub="Release and re-enter a gesture")
+        jarvis.say("Cursor unlocked. Release and re-enter a gesture.")
+        return
+    if accessibility and cmd in ("recenter cursor", "recenter tracking"):
+        if accessibility.recenter(pyautogui.position()):
+            banner.show("CURSOR RECENTERED", C_JARVIS)
+            jarvis.say("Cursor recentered.")
+        else:
+            banner.show("RECENTER UNAVAILABLE", C_PAUSE, sub="Move the cursor first")
+            jarvis.say("Move the cursor first, then recenter.")
+        return
+    if accessibility and cmd in ("dwell clicking on", "turn on dwell clicking"):
+        state['dwell_enabled'] = True
+        banner.show("DWELL CLICKING ON", C_JARVIS, sub="Hold cursor still to click")
+        jarvis.say("Dwell clicking on.")
+        return
+    if accessibility and cmd in ("dwell clicking off", "turn off dwell clicking"):
+        state['dwell_enabled'] = False
+        banner.show("DWELL CLICKING OFF", C_JARVIS)
+        jarvis.say("Dwell clicking off.")
+        return
 
     # ── Safety commands must take precedence over destructive commands ──
     if cmd in ("emergency stop", "stop joystep"):
@@ -987,11 +1060,13 @@ def process_voice_command(
         state['mode'] = InputMode.HAND
         banner.show("HAND MODE", C_TRACK, sub="Palm open to move cursor")
         jarvis.say("Switching to hand mode.")
+        if click_arbiter: click_arbiter.gate_physical()
         return
     if "face mode" in cmd or "switch face" in cmd:
         state['mode'] = InputMode.FACE
         banner.show("FACE MODE", C_FACE, sub="Press C to calibrate nose tracking")
         jarvis.say("Switching to face mode. Press C to calibrate.")
+        if click_arbiter: click_arbiter.gate_physical()
         return
 
     # ── Kill switch ───────────────────────────────────────────
@@ -1000,11 +1075,13 @@ def process_voice_command(
         banner.show("JARVIS PAUSED", C_PAUSE, dur=2.0,
                     sub="Say 'Hey JARVIS resume' to wake")
         jarvis.say("Tracking paused. Say Hey JARVIS resume to continue.", priority=True)
+        if click_arbiter: click_arbiter.gate_physical()
         return
     if any(w in cmd for w in ("resume", "wake up", "unpause", "continue", "activate")):
         state['paused'] = False
         banner.show("JARVIS ONLINE", C_TRACK, dur=2.0)
         jarvis.say("I am back online.", priority=True)
+        if click_arbiter: click_arbiter.gate_physical()
         return
 
     # ── Dictation mode ────────────────────────────────────────
@@ -1168,19 +1245,22 @@ def process_voice_command(
 
     # ── CLICKS ────────────────────────────────────────────────
     if "double click" in cmd:
-        pyautogui.doubleClick()
-        banner.show("Double Click", C_LCLICK)
-        jarvis.say("Double click.")
+        if not click_arbiter or click_arbiter.admit(ClickEvent("voice", "double")):
+            pyautogui.doubleClick()
+            banner.show("Double Click", C_LCLICK)
+            jarvis.say("Double click.")
         return
     if "right click" in cmd:
-        pyautogui.rightClick()
-        banner.show("Right Click", C_RCLICK)
-        jarvis.say("Right click.")
+        if not click_arbiter or click_arbiter.admit(ClickEvent("voice", "right")):
+            pyautogui.rightClick()
+            banner.show("Right Click", C_RCLICK)
+            jarvis.say("Right click.")
         return
     if "click" in cmd:
-        pyautogui.click()
-        banner.show("Click", C_LCLICK)
-        jarvis.say("Click.")
+        if not click_arbiter or click_arbiter.admit(ClickEvent("voice")):
+            pyautogui.click()
+            banner.show("Click", C_LCLICK)
+            jarvis.say("Click.")
         return
 
     # ── KEYBOARD SHORTCUTS ────────────────────────────────────
@@ -1269,6 +1349,43 @@ def process_voice_command(
     jarvis.say("Sorry, I don't know that command yet.")
 
 
+def process_voice_command(
+    cmd: str,
+    banner: Banner,
+    jarvis: JarvisVoice,
+    state: dict,
+    ripple: ClickRipple,
+    accessibility: AccessibilityCursorPipeline | None = None,
+    click_arbiter: ClickArbiter | None = None,
+    command_executor: CommandExecutor | None = None,
+    ai_session: AIAssistSession | None = None,
+) -> None:
+    """Parse, validate, route, then execute a recognized voice command.
+
+    The legacy executor remains the compatibility fallback.  No parsed command
+    can execute Python, shell text, or a subprocess outside existing explicit
+    allowlisted handlers.
+    """
+    ai_intent = parse_voice_intent(cmd)
+    if ai_session and ai_intent.kind is IntentKind.AI_ASSIST:
+        ai_session.start(str(ai_intent.arguments["task"]))
+        ai_session.step()
+        return
+    if ai_session and cmd.strip().lower() in {"emergency stop", "stop joystep"}:
+        ai_session.cancel()
+    executor = command_executor or CommandExecutor(
+        WindowsApplicationContextProvider(), ApplicationRouter())
+    recognize_and_execute(
+        cmd,
+        executor,
+        lambda text: _execute_legacy_voice_command(
+            text, banner, jarvis, state, ripple, accessibility, click_arbiter),
+    )
+    if executor.last_message:
+        banner.show(executor.last_message[:32], C_JARVIS)
+        jarvis.say(executor.last_message)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  VOICE THREAD
 # ═══════════════════════════════════════════════════════════════════════
@@ -1277,6 +1394,7 @@ class VoiceStatus:
     state:    VoiceState    = VoiceState.IDLE
     last_cmd: str           = ""
     command_recognized: bool = False  # presentation detail; not a voice state
+    awake_session: bool = False
     lock:     threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -1285,6 +1403,51 @@ LOCAL_DICTATION_COMMANDS = {
     "resume", "wake up", "unpause", "continue", "activate",
     "emergency stop", "stop joystep",
 }
+
+SLEEP_SESSION_COMMANDS = {
+    "go to sleep", "stop listening", "sleep jarvis", "stop listening jarvis",
+}
+
+
+@dataclass
+class AwakeSession:
+    """Explicit command-session lifetime, separate from dictation mode."""
+    timeout_seconds: float = AWAKE_SESSION_TIMEOUT
+    active: bool = False
+    last_activity: float = 0.0
+
+    def wake(self, now: float | None = None) -> None:
+        self.active, self.last_activity = True, (time.monotonic() if now is None else now)
+
+    def touch(self, now: float | None = None) -> None:
+        if self.active:
+            self.last_activity = time.monotonic() if now is None else now
+
+    def sleep(self) -> None:
+        self.active = False
+
+    def expired(self, now: float | None = None) -> bool:
+        return self.active and (time.monotonic() if now is None else now) - self.last_activity >= self.timeout_seconds
+
+
+def is_sleep_session_command(text: str) -> bool:
+    return text.strip().lower() in SLEEP_SESSION_COMMANDS
+
+
+def recognize_phrase(recognizer, source, *, timeout: float, phrase_time_limit: float,
+                     retries: int = VOICE_COMMAND_RETRIES) -> str:
+    """Capture a non-empty phrase with bounded retries; audio is never retained."""
+    last_error = None
+    for _ in range(retries + 1):
+        try:
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+            text = recognizer.recognize_google(audio).strip()
+            if text:
+                return text
+            last_error = ValueError("empty recognition")
+        except Exception as error:
+            last_error = error
+    raise last_error or RuntimeError("voice recognition failed")
 
 
 def is_local_dictation_command(text: str) -> bool:
@@ -1345,113 +1508,74 @@ def voice_thread_fn(cmd_q: queue.Queue, vs: VoiceStatus,
     print(f"[VOICE] Ready — say '{WAKE_WORD.upper()}' to activate.")
     jarvis.say("JARVIS online. Say Hey JARVIS for a command.")
 
-    while not stop.is_set():
-        # Voice is always active — works in HAND and FACE mode
+    awake = AwakeSession()
 
-        # ── Dictation mode: continuous speech-to-type ──────────
+    def update(voice_state: VoiceState, recognized: bool = False) -> None:
+        with vs.lock:
+            vs.state, vs.command_recognized, vs.awake_session = voice_state, recognized, awake.active
+
+    def capture(timeout: float, limit: float, retries: int = VOICE_COMMAND_RETRIES) -> str:
+        with mic as src:
+            return recognize_phrase(rec, src, timeout=timeout, phrase_time_limit=limit, retries=retries)
+
+    while not stop.is_set():
+        # Dictation is intentionally independent of the command awake session.
         if state.get('dictation'):
-            with vs.lock:
-                vs.state = VoiceState.DICTATION_ACTIVE
+            update(VoiceState.DICTATION_ACTIVE)
             try:
-                with mic as src:
-                    audio = rec.listen(src, timeout=3,
-                                       phrase_time_limit=10)
-                text = rec.recognize_google(audio).strip()
+                text = capture(3, 10, retries=0)
                 if route_dictation_text(text, cmd_q):
-                    with vs.lock:
-                        vs.last_cmd = text
-                        vs.state = VoiceState.COMMAND_EXECUTING
-                    time.sleep(0.3)
-                    with vs.lock:
-                        vs.state = VoiceState.COMMAND_IDLE
+                    with vs.lock: vs.last_cmd = text
+                    update(VoiceState.COMMAND_EXECUTING, recognized=True)
                 else:
                     pyautogui.write(text + " ", interval=0.02)
-                    print(f"[DICTATION] '{text}'")
-                    with vs.lock:
-                        vs.last_cmd = f"[dictation] {text[:40]}"
+                    with vs.lock: vs.last_cmd = f"[dictation] {text[:40]}"
             except Exception:
                 pass
             continue
 
-        # ── Normal: wait for wake word ─────────────────────────
-        # ── Normal: wait for wake word ─────────────────────────
-        with vs.lock:
-            vs.state = VoiceState.COMMAND_IDLE
-
-        # V-key already pressed — skip listen entirely
         if trigger_evt is not None and trigger_evt.is_set():
-            trigger_evt.clear()
-            print("[VOICE] V-key instant trigger ✓")
-            with vs.lock:
-                vs.state = VoiceState.COMMAND_LISTENING
-                vs.command_recognized = False
-            jarvis.say("Yes?", priority=True)
+            trigger_evt.clear(); awake.wake(); update(VoiceState.COMMAND_LISTENING)
+            print("[VOICE] V-key instant trigger ✓"); jarvis.say("Yes?", priority=True)
+
+        if awake.expired():
+            awake.sleep(); update(VoiceState.COMMAND_IDLE)
+            jarvis.say("Going to sleep. Say Hey JARVIS when you need me.")
+            continue
+
+        if not awake.active:
+            update(VoiceState.COMMAND_IDLE)
             try:
-                with mic as src:
-                    audio = rec.listen(src, timeout=LISTEN_TIMEOUT,
-                                       phrase_time_limit=8)
-                with vs.lock:
-                    vs.state = VoiceState.COMMAND_EXECUTING
-                cmd = rec.recognize_google(audio).lower().strip()
-                with vs.lock:
-                    vs.last_cmd = cmd
-                    vs.state    = VoiceState.COMMAND_EXECUTING
-                    vs.command_recognized = True
-                cmd_q.put(AppEvent(EventType.VOICE_COMMAND, cmd))
-                time.sleep(0.3)
-                with vs.lock:
-                    vs.state = VoiceState.COMMAND_IDLE
-                    vs.command_recognized = False
-            except sr.WaitTimeoutError:
-                jarvis.say("No speech detected. Try again.")
-            except sr.UnknownValueError:
-                jarvis.say("Couldn't understand. Speak louder or closer.")
-            except sr.RequestError:
-                jarvis.say("Network error. Check internet.")
+                heard = capture(0.7, 3, retries=0).lower()
             except Exception:
-                jarvis.say("Something went wrong.")
-                with vs.lock:
-                    vs.state = VoiceState.COMMAND_IDLE
-            continue
+                continue
+            if WAKE_WORD not in heard:
+                continue
+            awake.wake(); update(VoiceState.COMMAND_LISTENING)
+            jarvis.say("Yes?", priority=True); print("[VOICE] Wake word ✓")
 
+        # Once awake, accept every command until an explicit sleep request or
+        # bounded inactivity timeout; no second wake word is required.
+        update(VoiceState.COMMAND_LISTENING)
         try:
-            with mic as src:
-                audio = rec.listen(src, timeout=0.5, phrase_time_limit=4)
-            heard = rec.recognize_google(audio).lower()
-        except Exception:
-            continue
-
-        if WAKE_WORD not in heard:
-            continue
-
-        # Wake word hit
-        with vs.lock:
-            vs.state = VoiceState.COMMAND_LISTENING
-            vs.command_recognized = False
-        jarvis.say("Yes?", priority=True)
-        print("[VOICE] Wake word ✓")
-
-        try:
-            with mic as src:
-                audio = rec.listen(src, timeout=LISTEN_TIMEOUT,
-                                   phrase_time_limit=10)
-            with vs.lock:
-                vs.state = VoiceState.COMMAND_EXECUTING
-            cmd = rec.recognize_google(audio).lower().strip()
+            cmd = capture(LISTEN_TIMEOUT, VOICE_COMMAND_PHRASE_LIMIT)
+            awake.touch()
+            if is_sleep_session_command(cmd):
+                awake.sleep(); update(VoiceState.COMMAND_IDLE); jarvis.say("Going to sleep.")
+                continue
             print(f"[VOICE] '{cmd}'")
-            with vs.lock:
-                vs.last_cmd = cmd
-                vs.state    = VoiceState.COMMAND_EXECUTING
-                vs.command_recognized = True
+            with vs.lock: vs.last_cmd = cmd
+            update(VoiceState.COMMAND_EXECUTING, recognized=True)
             cmd_q.put(AppEvent(EventType.VOICE_COMMAND, cmd))
-            time.sleep(0.3)
-            with vs.lock:
-                vs.state = VoiceState.COMMAND_IDLE
-                vs.command_recognized = False
-        except Exception:
-            jarvis.say("I didn't catch that.")
-            with vs.lock:
-                vs.state = VoiceState.COMMAND_IDLE
+        except sr.WaitTimeoutError:
+            continue
+        except sr.UnknownValueError:
+            jarvis.say("I didn't catch that. Please repeat.")
+        except sr.RequestError:
+            jarvis.say("Speech recognition is unavailable. Press V to retry.")
+        except Exception as error:
+            print(f"[VOICE] Recognition error: {type(error).__name__}")
+            time.sleep(0.1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1623,6 +1747,7 @@ def draw_status_panel(frame, mode: InputMode, gesture,
         vstate = vs.state
         vlast  = vs.last_cmd
         vrecognized = vs.command_recognized
+        awake_session = vs.awake_session
 
     vstxt = {
         VoiceState.COMMAND_IDLE:      ("Say 'Hey JARVIS'", (110,110,110)),
@@ -1632,6 +1757,8 @@ def draw_status_panel(frame, mode: InputMode, gesture,
     }[vstate]
     if vstate == VoiceState.COMMAND_EXECUTING and vrecognized:
         vstxt = ("✓ HEARD", C_HEARD)
+    elif awake_session and vstate == VoiceState.COMMAND_LISTENING:
+        vstxt = ("AWAKE — LISTENING", C_VOICE)
     cv2.putText(frame, vstxt[0], (fw - 210, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, vstxt[1], 1)
     if vstate in (VoiceState.COMMAND_LISTENING, VoiceState.DICTATION_ACTIVE):
@@ -1706,10 +1833,28 @@ def main(metrics: BaselineMetrics | None = None):
 
     # ── App state (shared with voice processor) ───────────────
     state = ApplicationState(mode=InputMode.HAND)
+    state['dwell_enabled'] = False
 
     # ── Objects ───────────────────────────────────────────────
     cursor_ema  = EMA(CURSOR_SMOOTHING)
     cursor_pipeline = PassThroughCursorPipeline(FRAME_MARGIN)
+    accessibility_cursor = AccessibilityCursorPipeline()
+    click_arbiter = ClickArbiter()
+    dwell_click = DwellClickController()
+    command_executor = CommandExecutor(
+        WindowsApplicationContextProvider(), ApplicationRouter((WordAdapter(),)))
+    def ai_status(_state, message):
+        banner.show(message, C_JARVIS)
+        jarvis.say(message)
+    live_ai_provider = select_ai_provider()
+    external_ai_provider = isinstance(live_ai_provider, (OpenAIProvider, GeminiProvider))
+    live_perception = (EphemeralScreenPerception(pyautogui.screenshot, WindowsApplicationContextProvider().current)
+                       if external_ai_provider else StaticPerception())
+    ai_session = AIAssistSession(
+        live_ai_provider, live_perception,
+        RestrictedInputExecutor(pyautogui, click_arbiter, lambda: accessibility_cursor.locked),
+        status=ai_status,
+    )
     face_ema    = EMA(FACE_SMOOTHING)
     banner      = Banner()
     ripple      = ClickRipple()
@@ -1791,11 +1936,22 @@ def main(metrics: BaselineMetrics | None = None):
                 # The legacy string form remains accepted for compatibility
                 # with any external caller that has not yet migrated.
                 cmd = event.payload if isinstance(event, AppEvent) else event
-                process_voice_command(cmd, banner, jarvis, state, ripple)
+                process_voice_command(cmd, banner, jarvis, state, ripple,
+                                      accessibility_cursor, click_arbiter, command_executor, ai_session)
             except queue.Empty:
                 break
 
+        # AI Assist advances in small observe/plan/act/verify transitions.
+        # It remains cancellable by ordinary emergency-stop events and never
+        # changes the voice awake session on completion.
+        if ai_session.state in {
+            AISessionState.OBSERVING, AISessionState.PLANNING,
+            AISessionState.EXECUTING, AISessionState.VERIFYING,
+        }:
+            ai_session.step()
+
         now = time.monotonic()
+        dwell_click.enabled = state['dwell_enabled']
 
         # ══════════════════════════════════════════════════════
         #  HAND MODE
@@ -1808,15 +1964,24 @@ def main(metrics: BaselineMetrics | None = None):
 
             if gesture == HandGesture.TRACKING:
                 scroll_ref_y[0] = None
-                target_x, target_y = cursor_pipeline.hand_target(
-                    idx_norm, SW, SH, cursor_ema)
-                pyautogui.moveTo(target_x, target_y,
-                                 duration=0.05, tween=pyautogui.easeOutQuad)
-                metrics.cursor_update()
+                click_arbiter.arm_physical()
+                base_target = cursor_pipeline.hand_target(idx_norm, SW, SH, cursor_ema)
+                target = accessibility_cursor.output_target(base_target)
+                if target is not None:
+                    pyautogui.moveTo(target[0], target[1],
+                                     duration=0.05, tween=pyautogui.easeOutQuad)
+                    metrics.cursor_update()
+                if dwell_click.update(target, now, eligible=not state['paused']):
+                    if click_arbiter.admit(ClickEvent("dwell", created_at=now), now):
+                        pyautogui.click()
+                        banner.show("Dwell — Left Click", C_LCLICK)
+                        jarvis.say("Click")
 
             elif gesture == HandGesture.FIST:
                 scroll_ref_y[0] = None
                 cursor_pipeline.reset_hand(cursor_ema)
+                click_arbiter.arm_physical()
+                dwell_click.cancel()
 
             elif gesture == HandGesture.PINCH_L:
                 # ── CHANGE 1: now triggered by thumb-open gesture ─────
@@ -1824,25 +1989,27 @@ def main(metrics: BaselineMetrics | None = None):
                 cursor_pipeline.reset_hand(cursor_ema)
                 if (prev_gesture[0] != HandGesture.PINCH_L and
                         (now - last_click_t[0]) >= PINCH_COOLDOWN):
-                    last_click_t[0] = now
-                    cx, cy = pyautogui.position()
-                    pyautogui.click(cx, cy)
-                    banner.show("Thumb Up — Left Click", C_LCLICK)
-                    jarvis.say("Click")
-                    if lm_px and len(lm_px) > INDEX_TIP:
-                        ripple.add(lm_px[INDEX_TIP][0], lm_px[INDEX_TIP][1], C_LCLICK)
+                    if click_arbiter.admit(ClickEvent("hand", created_at=now), now):
+                        last_click_t[0] = now
+                        cx, cy = pyautogui.position()
+                        pyautogui.click(cx, cy)
+                        banner.show("Thumb Up — Left Click", C_LCLICK)
+                        jarvis.say("Click")
+                        if lm_px and len(lm_px) > INDEX_TIP:
+                            ripple.add(lm_px[INDEX_TIP][0], lm_px[INDEX_TIP][1], C_LCLICK)
 
             elif gesture == HandGesture.PINCH_R:
                 scroll_ref_y[0] = None
                 cursor_pipeline.reset_hand(cursor_ema)
                 if (prev_gesture[0] != HandGesture.PINCH_R and
                         (now - last_click_t[0]) >= PINCH_COOLDOWN):
-                    last_click_t[0] = now
-                    pyautogui.rightClick()
-                    banner.show("Right Click", C_RCLICK)
-                    jarvis.say("Right click")
-                    if lm_px and len(lm_px) > INDEX_TIP:
-                        ripple.add(lm_px[INDEX_TIP][0], lm_px[INDEX_TIP][1], C_RCLICK)
+                    if click_arbiter.admit(ClickEvent("hand", "right", now), now):
+                        last_click_t[0] = now
+                        pyautogui.rightClick()
+                        banner.show("Right Click", C_RCLICK)
+                        jarvis.say("Right click")
+                        if lm_px and len(lm_px) > INDEX_TIP:
+                            ripple.add(lm_px[INDEX_TIP][0], lm_px[INDEX_TIP][1], C_RCLICK)
 
             elif gesture == HandGesture.SCROLL:
                 cur_y = idx_norm[1]
@@ -1855,6 +2022,8 @@ def main(metrics: BaselineMetrics | None = None):
                         scroll_ref_y[0] = cur_y
             else:
                 scroll_ref_y[0] = None
+                click_arbiter.arm_physical()
+                dwell_click.cancel()
 
             prev_gesture[0] = gesture
             draw_hand_skeleton(frame, hr, gesture)
@@ -1888,7 +2057,8 @@ def main(metrics: BaselineMetrics | None = None):
                 nose_px = (int(raw_nx * fw), int(raw_ny * fh))
 
                 # ── DSM: update calibrator & move cursor ──────
-                pos = cursor_pipeline.face_target(dsm, raw_nx, raw_ny)
+                base_pos = cursor_pipeline.face_target(dsm, raw_nx, raw_ny)
+                pos = accessibility_cursor.output_target(base_pos)
                 if pos is not None:
                     pyautogui.moveTo(pos[0], pos[1])
                     metrics.cursor_update()
@@ -1909,16 +2079,18 @@ def main(metrics: BaselineMetrics | None = None):
                 if not _voice_busy:
                     # ── CHANGE 2: wink fires left click ──────
                     if wink_event == "left_click":
-                        pyautogui.click()
-                        banner.show("Wink — Left Click", C_LCLICK)
-                        jarvis.say("Click")
-                        ripple.add(nose_px[0], nose_px[1], C_LCLICK)
+                        if click_arbiter.admit(ClickEvent("face", created_at=now), now):
+                            pyautogui.click()
+                            banner.show("Wink — Left Click", C_LCLICK)
+                            jarvis.say("Click")
+                            ripple.add(nose_px[0], nose_px[1], C_LCLICK)
                     # Long blink still fires right click
                     elif blink_event == "right_click":
-                        pyautogui.rightClick()
-                        banner.show("Long Blink — Right Click", C_RCLICK)
-                        jarvis.say("Right click")
-                        ripple.add(nose_px[0], nose_px[1], C_RCLICK)
+                        if click_arbiter.admit(ClickEvent("face", "right", now), now):
+                            pyautogui.rightClick()
+                            banner.show("Long Blink — Right Click", C_RCLICK)
+                            jarvis.say("Right click")
+                            ripple.add(nose_px[0], nose_px[1], C_RCLICK)
 
                 # ── CHANGE 3: Mouth-hold → LEFT CLICK ────────
                 # MouthClickDetector now requires MOUTH_HOLD_DUR (0.4s) of
@@ -1926,13 +2098,22 @@ def main(metrics: BaselineMetrics | None = None):
                 mouth_event = mouth_det.update(lms, fh)
                 mouth_st    = mouth_event == "left_click"
                 if mouth_st and not _voice_busy:
-                    pyautogui.click()
-                    banner.show("Mouth Hold — Left Click", C_LCLICK)
-                    jarvis.say("Click")
-                    ripple.add(nose_px[0], nose_px[1], C_LCLICK)
+                    if click_arbiter.admit(ClickEvent("face", created_at=now), now):
+                        pyautogui.click()
+                        banner.show("Mouth Hold — Left Click", C_LCLICK)
+                        jarvis.say("Click")
+                        ripple.add(nose_px[0], nose_px[1], C_LCLICK)
+                if blink_event == "none" and wink_event == "none" and not mouth_st:
+                    click_arbiter.arm_physical()
+                if dwell_click.update(pos, now, eligible=not _voice_busy):
+                    if click_arbiter.admit(ClickEvent("dwell", created_at=now), now):
+                        pyautogui.click()
+                        banner.show("Dwell — Left Click", C_LCLICK)
+                        jarvis.say("Click")
 
             else:
                 face_trail.clear()
+                dwell_click.cancel()
 
             # ── Draw face overlay ─────────────────────────────
             draw_face_overlay_dsm(frame, nose_px, face_trail, face_lms,
@@ -1960,6 +2141,7 @@ def main(metrics: BaselineMetrics | None = None):
                     f"Calibration complete. X multiplier {dsm.mult_x}. "
                     f"Y multiplier {dsm.mult_y}. You are now in control."
                 )
+                click_arbiter.gate_physical()
             dsm_prev_state[0] = dsm.state
 
         # ── Ripple + banner + status ──────────────────────────
@@ -1993,6 +2175,8 @@ def main(metrics: BaselineMetrics | None = None):
                              if state['mode'] == InputMode.HAND
                              else InputMode.HAND)
             jarvis.say(f"{state['mode'].value} mode.")
+            click_arbiter.gate_physical()
+            dwell_click.cancel()
         elif key == ord('v') or key == ord('V'):
             voice_trigger_evt.set()
             banner.show("JARVIS LISTENING", C_VOICE, dur=1.0,
@@ -2000,12 +2184,18 @@ def main(metrics: BaselineMetrics | None = None):
         elif key == ord('p'):
             state['paused'] = not state['paused']
             jarvis.say("Paused." if state['paused'] else "Resumed.")
+            click_arbiter.gate_physical()
+            dwell_click.cancel()
         elif key == ord('h'):
             state['mode'] = InputMode.HAND
             jarvis.say("Hand mode.")
+            click_arbiter.gate_physical()
+            dwell_click.cancel()
         elif key == ord('f'):
             state['mode'] = InputMode.FACE
             jarvis.say("Face mode. Press C to calibrate.")
+            click_arbiter.gate_physical()
+            dwell_click.cancel()
         elif key == ord('c') or key == ord('C'):
             if state['mode'] == InputMode.FACE and not state['paused']:
                 # Snapshot current nose as the neutral resting position
@@ -2017,6 +2207,8 @@ def main(metrics: BaselineMetrics | None = None):
                         _lm = _tmp.multi_face_landmarks[0].landmark
                         _nx, _ny = _lm[NOSE_TIP].x, _lm[NOSE_TIP].y
                 dsm.start_calibration(_nx, _ny)
+                click_arbiter.gate_physical()
+                dwell_click.cancel()
                 blink_det   = BlinkDetector()
                 wink_det    = WinkDetector()    # CHANGE 2: reset wink on recalibrate
                 mouth_det   = MouthClickDetector()
