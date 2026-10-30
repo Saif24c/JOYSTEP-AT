@@ -1,0 +1,2 @@
+# Optional Stage 8 runtime dependency for the OpenAI Responses API provider.
+openai==3.16.2

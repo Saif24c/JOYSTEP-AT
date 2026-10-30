@@ -1,0 +1,2 @@
+# Optional Gemini provider for JOYSTEP AI Assist.
+google-genai==2.24.0

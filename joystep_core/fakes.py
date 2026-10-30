@@ -96,9 +96,14 @@ class FakeSystemActions:
 @dataclass
 class FakeRecognizer:
     phrases: list[str] = field(default_factory=list)
-    def listen(self, timeout: float, phrase_time_limit: float) -> str:
+    failures: list[Exception] = field(default_factory=list)
+    def listen(self, source: Any = None, timeout: float = 0, phrase_time_limit: float = 0) -> str:
+        if self.failures:
+            raise self.failures.pop(0)
         if not self.phrases:
             raise TimeoutError("no fake phrase")
         return self.phrases.pop(0)
     def recognize(self, audio: Any) -> str:
         return str(audio)
+    def recognize_google(self, audio: Any) -> str:
+        return self.recognize(audio)

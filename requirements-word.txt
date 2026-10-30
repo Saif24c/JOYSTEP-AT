@@ -1,0 +1,2 @@
+# Optional Stage 6 runtime dependency for structured Microsoft Word COM control.
+pywin32==312
